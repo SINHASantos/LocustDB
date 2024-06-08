@@ -9,9 +9,11 @@ use std::{mem, str};
 
 use futures::channel::oneshot;
 use futures::executor::block_on;
+use inner_locustdb::meta_store::PartitionMetadata;
 use itertools::Itertools;
+use locustdb_serialization::event_buffer::{ColumnBuffer, ColumnData, EventBuffer, TableBuffer};
 
-use crate::disk_store::storage::{Storage, WALSegment};
+use crate::disk_store::storage::Storage;
 use crate::disk_store::*;
 use crate::engine::query_task::{BasicTypeColumn, QueryTask};
 use crate::engine::Query;
@@ -19,8 +21,6 @@ use crate::ingest::colgen::GenTable;
 use crate::ingest::input_column::InputColumn;
 use crate::ingest::raw_val::RawVal;
 use crate::locustdb::Options;
-use crate::logging_client::ColumnData;
-use crate::logging_client::EventBuffer;
 use crate::mem_store::partition::Partition;
 use crate::mem_store::table::*;
 use crate::perf_counter::PerfCounter;
@@ -28,7 +28,9 @@ use crate::scheduler::disk_read_scheduler::DiskReadScheduler;
 use crate::scheduler::*;
 use crate::{mem_store::*, NoopStorage};
 
+use self::meta_store::SubpartitionMetadata;
 use self::raw_col::MixedCol;
+use self::wal_segment::WalSegment;
 
 pub struct InnerLocustDB {
     tables: RwLock<HashMap<String, Table>>,
@@ -52,14 +54,17 @@ impl InnerLocustDB {
     pub fn new(opts: &Options) -> InnerLocustDB {
         let lru = Lru::default();
         let perf_counter = Arc::new(PerfCounter::default());
-        let storage = opts.db_path.as_ref().map(|path| {
-            let (storage, wal) = Storage::new(path, perf_counter.clone(), false);
-            (Arc::new(storage), wal)
-        });
-        let (storage, existing_tables) = match storage {
-            Some((storage, wal_segments)) => {
-                let tables = Table::restore_tables_from_disk(&storage, wal_segments, &lru);
-                (Some(storage), tables)
+        let (storage, tables) = match opts.db_path.clone() {
+            Some(path) => {
+                let perf_counter = perf_counter.clone();
+                let lru = lru.clone();
+                std::thread::spawn(move || {
+                    let (storage, wal) = Storage::new(&path, perf_counter, false);
+                    let tables = Table::restore_tables_from_disk(&storage, wal, &lru);
+                    (Some(Arc::new(storage)), tables)
+                })
+                .join()
+                .unwrap()
             }
             None => (None, HashMap::new()),
         };
@@ -73,8 +78,8 @@ impl InnerLocustDB {
             !opts.mem_lz4,
         ));
 
-        InnerLocustDB {
-            tables: RwLock::new(existing_tables),
+        let locustdb = InnerLocustDB {
+            tables: RwLock::new(tables),
             lru,
             disk_read_scheduler,
             running: AtomicBool::new(true),
@@ -89,7 +94,9 @@ impl InnerLocustDB {
 
             idle_queue: Condvar::new(),
             task_queue: Mutex::new(VecDeque::new()),
-        }
+        };
+        let _ = locustdb.create_if_empty_no_ingest("_meta_tables");
+        locustdb
     }
 
     pub fn start_worker_threads(locustdb: &Arc<InnerLocustDB>) {
@@ -169,23 +176,54 @@ impl InnerLocustDB {
         tables.get(table).unwrap().ingest(row)
     }
 
-    pub fn ingest_efficient(&self, events: EventBuffer) {
+    pub fn ingest_efficient(&self, mut events: EventBuffer) {
         let (wal_size, wal_condvar) = &self.wal_size;
         let mut wal_size = wal_size.lock().unwrap();
         while *wal_size > self.opts.max_wal_size_bytes {
+            log::warn!("wal size limit exceeded, blocking ingestion");
             wal_size = wal_condvar.wait(wal_size).unwrap();
         }
 
-        if let Some(storage) = &self.storage {
-            let bytes_written = storage.persist_wal_segment(WALSegment {
-                id: 0,
-                data: Cow::Borrowed(&events),
-            });
-            *wal_size += bytes_written;
+        let mut _meta_tables_rows = vec![];
+        for table in events.tables.keys() {
+            if let Some(row) = self.create_if_empty_no_ingest(table) {
+                _meta_tables_rows.push(row);
+            }
         }
+        if !_meta_tables_rows.is_empty() {
+            let (timestamps, names): (Vec<_>, Vec<_>) = _meta_tables_rows.into_iter().unzip();
+            let len = timestamps.len() as u64;
+            let mut columns = HashMap::new();
+            columns.insert(
+                "timestamp".to_string(),
+                ColumnBuffer {
+                    data: ColumnData::I64(timestamps),
+                },
+            );
+            columns.insert(
+                "name".to_string(),
+                ColumnBuffer {
+                    data: ColumnData::String(names),
+                },
+            );
+            let meta_tables_buffer = TableBuffer { len, columns };
+            events
+                .tables
+                .insert("_meta_tables".to_string(), meta_tables_buffer);
+        }
+
+        let bytes_written_join_handle = self.storage.as_ref().map(|storage| {
+            let events = events.clone();
+            let storage = storage.clone();
+            thread::spawn(move || {
+                storage.persist_wal_segment(WalSegment {
+                    id: 0,
+                    data: Cow::Borrowed(&events),
+                })
+            })
+        });
         // TODO: code duplicated in Table::restore_tables_from_disk
         for (table, data) in events.tables {
-            self.create_if_empty(&table);
             let tables = self.tables.read().unwrap();
             let table = tables.get(&table).unwrap();
             let rows = data.len;
@@ -209,6 +247,25 @@ impl InnerLocustDB {
                             }
                         }
                         ColumnData::Sparse(data) => InputColumn::NullableFloat(rows, data),
+                        ColumnData::I64(data) => {
+                            if (data.len() as u64) < rows {
+                                InputColumn::NullableInt(
+                                    rows,
+                                    data.into_iter()
+                                        .enumerate()
+                                        .map(|(i, v)| (i as u64, v))
+                                        .collect(),
+                                )
+                            } else {
+                                InputColumn::Int(data)
+                            }
+                        }
+                        ColumnData::String(data) => {
+                            assert!(data.len() == rows as usize);
+                            InputColumn::Str(data)
+                        }
+                        ColumnData::Empty => InputColumn::Null(rows as usize),
+                        ColumnData::SparseI64(data) => InputColumn::NullableInt(rows, data),
                     };
                     (k, col)
                 })
@@ -216,6 +273,10 @@ impl InnerLocustDB {
             table.ingest_homogeneous(columns);
         }
 
+        if let Some(jh) = bytes_written_join_handle {
+            let bytes_written = jh.join().unwrap();
+            *wal_size += bytes_written;
+        }
         wal_condvar.notify_all();
     }
 
@@ -258,7 +319,7 @@ impl InnerLocustDB {
         }
 
         if let Some(s) = self.storage.as_ref() {
-            s.persist_partitions_delete_wal(new_partitions)
+            s.persist_partitions_delete_wal(new_partitions);
         }
 
         for (table, id, (range, parts)) in compactions {
@@ -344,9 +405,13 @@ impl InnerLocustDB {
         task_queue.clear();
     }
 
-    pub fn mem_tree(&self, depth: usize) -> Vec<MemTreeTable> {
+    pub fn mem_tree(&self, depth: usize, table: Option<String>) -> Vec<MemTreeTable> {
         let tables = self.tables.read().unwrap();
-        tables.values().map(|table| table.mem_tree(depth)).collect()
+        tables
+            .values()
+            .filter(|t| table.as_ref().map(|name| name == t.name()).unwrap_or(true))
+            .map(|table| table.mem_tree(depth))
+            .collect()
     }
 
     pub fn stats(&self) -> Vec<TableStats> {
@@ -356,6 +421,29 @@ impl InnerLocustDB {
 
     pub fn gen_partition(&self, opts: &GenTable, p: u64) {
         opts.gen(self, p);
+    }
+
+    #[must_use]
+    fn create_if_empty_no_ingest(&self, table: &str) -> Option<(i64, String)> {
+        let exists = {
+            let tables = self.tables.read().unwrap();
+            tables.contains_key(table)
+        };
+        if !exists {
+            {
+                let mut tables = self.tables.write().unwrap();
+                tables.insert(table.to_string(), Table::new(table, self.lru.clone()));
+            }
+            Some((
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+                table.to_string(),
+            ))
+        } else {
+            None
+        }
     }
 
     fn create_if_empty(&self, table: &str) {
@@ -431,6 +519,7 @@ impl InnerLocustDB {
             } else {
                 self.wal_flush();
                 *wal_size = 0;
+                wal_condvar.notify_all();
             }
         }
     }
@@ -485,7 +574,10 @@ fn subpartition(
     let mut acc = PartitionBuilder::default();
     fn create_subpartition(acc: &mut PartitionBuilder) {
         acc.subpartition_metadata.push((
-            acc.subpartition.iter().map(|c| c.name().to_string()).collect(),
+            acc.subpartition
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect(),
             acc.bytes,
         ));
         acc.subpartitions.push(mem::take(&mut acc.subpartition));
@@ -516,17 +608,17 @@ fn subpartition(
                     && first_col
                         .chars()
                         .all(|c| (c.is_alphanumeric() && c.is_lowercase()) || c == '_');
-                let subpartition_key =
-                    if column_names.len() == 1 && is_column_name_filesystem_safe {
-                        format!("x{}", first_col)
-                    } else {
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        for col in column_names {
-                            hasher.update(col);
-                        }
-                        format!("{:x}", hasher.finalize())
-                    };
+                let subpartition_key = if column_names.len() == 1 && is_column_name_filesystem_safe
+                {
+                    format!("x{}", first_col)
+                } else {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    for col in column_names {
+                        hasher.update(col);
+                    }
+                    format!("{:x}", hasher.finalize())
+                };
                 SubpartitionMetadata {
                     subpartition_key,
                     size_bytes: *size,

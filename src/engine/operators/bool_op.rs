@@ -1,22 +1,23 @@
+#![allow(unused)]
 use crate::engine::*;
 use std::fmt;
 use std::marker::PhantomData;
 
 #[derive(Debug)]
-pub struct BooleanOperator<T> {
+pub struct InplaceBooleanOperator<T> {
     lhs: BufferRef<u8>,
     rhs: BufferRef<u8>,
     output: BufferRef<u8>,
     op: PhantomData<T>,
 }
 
-impl<'a, T: BooleanOp + fmt::Debug + 'a> BooleanOperator<T> {
+impl<'a, T: BooleanOp + fmt::Debug + 'a> InplaceBooleanOperator<T> {
     pub fn compare(
         lhs: BufferRef<u8>,
         rhs: BufferRef<u8>,
         output: BufferRef<u8>,
     ) -> BoxedOperator<'a> {
-        Box::new(BooleanOperator::<T> {
+        Box::new(InplaceBooleanOperator::<T> {
             lhs,
             rhs,
             output,
@@ -25,7 +26,7 @@ impl<'a, T: BooleanOp + fmt::Debug + 'a> BooleanOperator<T> {
     }
 }
 
-impl<'a, T: BooleanOp + fmt::Debug> VecOperator<'a> for BooleanOperator<T> {
+impl<'a, T: BooleanOp + fmt::Debug> VecOperator<'a> for InplaceBooleanOperator<T> {
     fn execute(&mut self, _: bool, scratchpad: &mut Scratchpad<'a>) -> Result<(), QueryError> {
         if scratchpad.is_alias(self.lhs, self.rhs) {
             let mut result = scratchpad.get_mut(self.lhs);
@@ -33,7 +34,7 @@ impl<'a, T: BooleanOp + fmt::Debug> VecOperator<'a> for BooleanOperator<T> {
         } else {
             let mut result = scratchpad.get_mut(self.lhs);
             let rhs = scratchpad.get(self.rhs);
-            T::evaluate(&mut result, &rhs);
+            T::evaluate_inplace(&mut result, &rhs);
         }
         Ok(())
     }
@@ -63,15 +64,14 @@ impl<'a, T: BooleanOp + fmt::Debug> VecOperator<'a> for BooleanOperator<T> {
     }
 
     fn display_op(&self, _: bool) -> String {
-        format!("{} {} {}", self.lhs, T::symbol(), self.rhs)
+        format!("mut {} {} {}", self.lhs, T::symbol(), self.rhs)
     }
 }
 
 pub trait BooleanOp {
-    fn evaluate(lhs: &mut [u8], rhs: &[u8]);
+    fn evaluate_inplace(lhs: &mut [u8], rhs: &[u8]);
     // Specialized case for when lhs refers to the same buffer as rhs
     fn evaluate_aliased(lhs: &mut [u8]);
-    fn name() -> &'static str;
     fn symbol() -> &'static str;
 }
 
@@ -79,7 +79,7 @@ pub trait BooleanOp {
 pub struct BooleanOr;
 
 impl BooleanOp for BooleanOr {
-    fn evaluate(lhs: &mut [u8], rhs: &[u8]) {
+    fn evaluate_inplace(lhs: &mut [u8], rhs: &[u8]) {
         for (l, r) in lhs.iter_mut().zip(rhs) {
             *l |= r;
         }
@@ -87,9 +87,6 @@ impl BooleanOp for BooleanOr {
 
     fn evaluate_aliased(_lhs: &mut [u8]) {}
 
-    fn name() -> &'static str {
-        "bit_vec_or"
-    }
     fn symbol() -> &'static str {
         "|"
     }
@@ -99,7 +96,7 @@ impl BooleanOp for BooleanOr {
 pub struct BooleanAnd;
 
 impl BooleanOp for BooleanAnd {
-    fn evaluate(lhs: &mut [u8], rhs: &[u8]) {
+    fn evaluate_inplace(lhs: &mut [u8], rhs: &[u8]) {
         for (l, r) in lhs.iter_mut().zip(rhs) {
             *l &= r;
         }
@@ -107,9 +104,6 @@ impl BooleanOp for BooleanAnd {
 
     fn evaluate_aliased(_lhs: &mut [u8]) {}
 
-    fn name() -> &'static str {
-        "bit_vec_and"
-    }
     fn symbol() -> &'static str {
         "&"
     }

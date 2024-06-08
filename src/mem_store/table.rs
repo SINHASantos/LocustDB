@@ -6,18 +6,22 @@ use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 
 use itertools::Itertools;
+use locustdb_serialization::event_buffer::ColumnData;
 
-use crate::disk_store::storage::{Storage, WALSegment};
+use crate::disk_store::storage::Storage;
 use crate::disk_store::*;
 use crate::ingest::buffer::Buffer;
 use crate::ingest::input_column::InputColumn;
 use crate::ingest::raw_val::RawVal;
-use crate::logging_client::ColumnData;
 use crate::mem_store::partition::{ColumnLocator, Partition};
 use crate::mem_store::*;
 
+use self::meta_store::PartitionMetadata;
+use self::wal_segment::WalSegment;
+
 pub struct Table {
     name: String,
+    // `partitions` lock has to be always acquired before `buffer` lock
     partitions: RwLock<HashMap<PartitionID, Arc<Partition>>>,
     next_partition_id: AtomicU64,
     next_partition_offset: AtomicUsize,
@@ -47,10 +51,10 @@ impl Table {
     }
 
     pub fn snapshot(&self) -> Vec<Arc<Partition>> {
+        let buffer = self.buffer.lock().unwrap();
         let partitions = self.partitions.read().unwrap();
         let mut partitions: Vec<_> = partitions.values().cloned().collect();
         let offset = partitions.iter().map(|p| p.len()).sum::<usize>();
-        let buffer = self.buffer.lock().unwrap();
         if buffer.len() > 0 {
             partitions.push(Arc::new(
                 Partition::from_buffer(
@@ -88,7 +92,7 @@ impl Table {
 
     pub fn restore_tables_from_disk(
         storage: &Storage,
-        wal_segments: Vec<WALSegment>,
+        wal_segments: Vec<WalSegment>,
         lru: &Lru,
     ) -> HashMap<String, Table> {
         let mut tables = HashMap::new();
@@ -130,6 +134,25 @@ impl Table {
                                 }
                             }
                             ColumnData::Sparse(data) => InputColumn::NullableFloat(rows, data),
+                            ColumnData::I64(data) => {
+                                if (data.len() as u64) < rows {
+                                    InputColumn::NullableInt(
+                                        rows,
+                                        data.into_iter()
+                                            .enumerate()
+                                            .map(|(i, v)| (i as u64, v))
+                                            .collect(),
+                                    )
+                                } else {
+                                    InputColumn::Int(data)
+                                }
+                            }
+                            ColumnData::String(data) => {
+                                assert!((data.len() as u64) == rows, "rows: {}, data.len(): {}", rows, data.len());
+                                InputColumn::Str(data)
+                            }
+                            ColumnData::Empty => InputColumn::Null(rows as usize),
+                            ColumnData::SparseI64(data) => InputColumn::NullableInt(rows, data),
                         };
                         (k, col)
                     })

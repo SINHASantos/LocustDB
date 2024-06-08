@@ -35,6 +35,7 @@ pub enum EncodingType {
 
     // Single scalar value
     ScalarI64,
+    ScalarF64,
     ScalarStr,
     ScalarString,
     ConstVal,
@@ -63,20 +64,21 @@ impl EncodingType {
         }
     }
 
+    /// Returns the nullable version of the encoding type.
+    /// This is used when propagating nullability of type casts.
+    /// Types that already represent null values will return themselves.
     pub fn nullable(&self) -> EncodingType {
         match self {
-            EncodingType::Str | EncodingType::NullableStr | EncodingType::OptStr => {
-                EncodingType::NullableStr
-            }
+            EncodingType::Str | EncodingType::NullableStr => EncodingType::NullableStr,
             EncodingType::I64 | EncodingType::NullableI64 => EncodingType::NullableI64,
             EncodingType::U8 | EncodingType::NullableU8 => EncodingType::NullableU8,
             EncodingType::U16 | EncodingType::NullableU16 => EncodingType::NullableU16,
             EncodingType::U32 | EncodingType::NullableU32 => EncodingType::NullableU32,
             EncodingType::U64 | EncodingType::NullableU64 => EncodingType::NullableU64,
-            EncodingType::F64 | EncodingType::NullableF64 | EncodingType::OptF64 => {
-                EncodingType::NullableF64
-            }
+            EncodingType::F64 | EncodingType::NullableF64 => EncodingType::NullableF64,
             EncodingType::Val => EncodingType::Val,
+            EncodingType::OptStr => EncodingType::OptStr,
+            EncodingType::OptF64 => EncodingType::OptF64,
             _ => panic!("{:?} does not have a corresponding nullable type", &self),
         }
     }
@@ -93,6 +95,8 @@ impl EncodingType {
         }
     }
 
+    /// Returns whether the encoding type is nullable, i.e., is a basic type with an associated null map.
+    /// This does not apply to types like OptStr which can naturally represent null values.
     pub fn is_nullable(&self) -> bool {
         match self {
             EncodingType::NullableStr
@@ -115,6 +119,40 @@ impl EncodingType {
             | EncodingType::Bitvec
             | EncodingType::Val
             | EncodingType::Null
+            | EncodingType::ScalarF64
+            | EncodingType::ScalarI64
+            | EncodingType::ScalarStr
+            | EncodingType::ScalarString
+            | EncodingType::ConstVal
+            | EncodingType::ByteSlices(_)
+            | EncodingType::ValRows
+            | EncodingType::Premerge
+            | EncodingType::MergeOp => false,
+        }
+    }
+
+    /// Returns whether the encoding type can represent null values without an associated null map.
+    pub fn is_naturally_nullable(&self) -> bool {
+        match self {
+            EncodingType::Val | EncodingType::OptStr | EncodingType::OptF64 => true,
+            EncodingType::NullableStr
+            | EncodingType::NullableI64
+            | EncodingType::NullableU8
+            | EncodingType::NullableU16
+            | EncodingType::NullableU32
+            | EncodingType::NullableU64
+            | EncodingType::NullableF64
+            | EncodingType::Str
+            | EncodingType::I64
+            | EncodingType::U8
+            | EncodingType::U16
+            | EncodingType::U32
+            | EncodingType::U64
+            | EncodingType::F64
+            | EncodingType::USize
+            | EncodingType::Bitvec
+            | EncodingType::Null
+            | EncodingType::ScalarF64
             | EncodingType::ScalarI64
             | EncodingType::ScalarStr
             | EncodingType::ScalarString
@@ -146,6 +184,7 @@ impl EncodingType {
             | EncodingType::Bitvec
             | EncodingType::Val
             | EncodingType::Null
+            | EncodingType::ScalarF64
             | EncodingType::ScalarI64
             | EncodingType::ScalarStr
             | EncodingType::ScalarString
@@ -182,6 +221,7 @@ impl EncodingType {
             | EncodingType::ValRows
             | EncodingType::Premerge
             | EncodingType::MergeOp => false,
+            EncodingType::ScalarF64
             | EncodingType::ScalarI64
             | EncodingType::ScalarStr
             | EncodingType::ScalarString
@@ -216,6 +256,7 @@ impl EncodingType {
             | EncodingType::Premerge
             | EncodingType::Null
             | EncodingType::MergeOp => false,
+            EncodingType::ScalarF64
             | EncodingType::ScalarI64
             | EncodingType::ScalarStr
             | EncodingType::ScalarString
@@ -230,12 +271,48 @@ impl EncodingType {
             match (self, other) {
                 (EncodingType::Val, _) => EncodingType::Val,
                 (_, EncodingType::Val) => EncodingType::Val,
+                (EncodingType::F64, EncodingType::I64) => EncodingType::Val,
+                (EncodingType::I64, EncodingType::F64) => EncodingType::Val,
                 (EncodingType::OptStr, EncodingType::Str) => EncodingType::OptStr,
                 (EncodingType::Str, EncodingType::OptStr) => EncodingType::OptStr,
                 (EncodingType::OptF64, EncodingType::F64) => EncodingType::OptF64,
                 (EncodingType::F64, EncodingType::OptF64) => EncodingType::OptF64,
                 _ => unimplemented!("lub not implemented for {:?} and {:?}", self, other),
             }
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            EncodingType::Str => 0u8,
+            EncodingType::I64 => 1,
+            EncodingType::U8 => 2,
+            EncodingType::U16 => 3,
+            EncodingType::U32 => 4,
+            EncodingType::U64 => 5,
+            EncodingType::F64 => 6,
+            EncodingType::Val => 7,
+            EncodingType::USize => 8,
+            EncodingType::Bitvec => 9,
+            EncodingType::NullableStr => 10,
+            EncodingType::NullableI64 => 11,
+            EncodingType::NullableU8 => 12,
+            EncodingType::NullableU16 => 13,
+            EncodingType::NullableU32 => 14,
+            EncodingType::NullableU64 => 15,
+            EncodingType::NullableF64 => 16,
+            EncodingType::OptStr => 17,
+            EncodingType::OptF64 => 18,
+            EncodingType::Null => 19,
+            EncodingType::ScalarF64 => 20,
+            EncodingType::ScalarI64 => 21,
+            EncodingType::ScalarStr => 22,
+            EncodingType::ScalarString => 23,
+            EncodingType::ConstVal => 24,
+            EncodingType::ValRows => 25,
+            EncodingType::Premerge => 26,
+            EncodingType::MergeOp => 27,
+            EncodingType::ByteSlices(x) => 64 + u8::try_from(x).unwrap(),
         }
     }
 }
@@ -286,13 +363,13 @@ impl BasicType {
 pub struct Type {
     pub decoded: BasicType,
     // this could just be of type `Codec`, using the identity codec instead of None
-    pub codec: Option<Codec>,
+    pub codec: Codec,
     pub is_scalar: bool,
     pub is_borrowed: bool,
 }
 
 impl Type {
-    pub fn new(basic: BasicType, codec: Option<Codec>) -> Type {
+    pub fn new(basic: BasicType, codec: Codec) -> Type {
         Type {
             decoded: basic,
             codec,
@@ -304,7 +381,7 @@ impl Type {
     pub fn encoded(codec: Codec) -> Type {
         Type {
             decoded: codec.decoded_type(),
-            codec: Some(codec),
+            codec,
             is_scalar: false,
             is_borrowed: false,
         }
@@ -313,40 +390,34 @@ impl Type {
     pub fn unencoded(basic: BasicType) -> Type {
         Type {
             decoded: basic,
-            codec: None,
+            codec: Codec::identity(basic),
             is_scalar: false,
             is_borrowed: false,
         }
     }
 
     pub fn bit_vec() -> Type {
-        Type::new(BasicType::Boolean, None).mutable()
+        Type::unencoded(BasicType::Boolean).mutable()
     }
 
     pub fn integer() -> Type {
-        Type::new(BasicType::Integer, None)
+        Type::unencoded(BasicType::Integer)
     }
 
     pub fn is_encoded(&self) -> bool {
-        self.codec.as_ref().map_or(false, |c| !c.is_identity())
+        !self.codec.is_identity()
     }
 
     pub fn is_summation_preserving(&self) -> bool {
-        self.codec
-            .as_ref()
-            .map_or(true, |c| c.is_summation_preserving())
+        self.codec.is_summation_preserving()
     }
 
     pub fn is_elementwise_decodable(&self) -> bool {
-        self.codec
-            .as_ref()
-            .map_or(true, |c| c.is_elementwise_decodable())
+        self.codec.is_elementwise_decodable()
     }
 
     pub fn is_order_preserving(&self) -> bool {
-        self.codec
-            .as_ref()
-            .map_or(true, |c| c.is_order_preserving())
+        self.codec.is_order_preserving()
     }
 
     pub fn is_nullable(&self) -> bool {
@@ -356,22 +427,20 @@ impl Type {
     pub fn scalar(basic: BasicType) -> Type {
         Type {
             decoded: basic,
-            codec: None,
+            codec: Codec::identity(basic),
             is_scalar: true,
             is_borrowed: false,
         }
     }
 
     pub fn encoding_type(&self) -> EncodingType {
-        self.codec
-            .as_ref()
-            .map_or(self.decoded.to_encoded(), |x| x.encoding_type())
+        self.codec.encoding_type()
     }
 
     pub fn decoded(&self) -> Type {
         let mut result = (*self).clone();
         result.is_borrowed = !self.is_encoded();
-        result.codec = None;
+        result.codec = Codec::identity(self.decoded);
         result
     }
 

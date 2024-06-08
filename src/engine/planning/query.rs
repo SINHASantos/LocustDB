@@ -3,10 +3,8 @@ use crate::ingest::raw_val::RawVal;
 use crate::mem_store::column::DataSource;
 use crate::syntax::expression::*;
 use crate::syntax::limit::*;
-use crate::QueryError;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::iter::Iterator;
 use std::ops::Range;
 use std::sync::Arc;
 use std::u64;
@@ -94,6 +92,12 @@ impl NormalFormQuery {
                 && self.order_by.len() == 1
                 && !ranking.is_constant()
             {
+                let ranking = if ranking.is_nullable() {
+                    // TODO: not implemented for all types (e.g. NullableU8). Need to upcast to u64, add corresponding fused types, or add nullable top_n
+                    planner.fuse_nulls(ranking)
+                } else {
+                    ranking
+                };
                 planner.top_n(ranking, limit, *desc)
             } else {
                 // PERF: sort directly if only single column selected
@@ -134,18 +138,12 @@ impl NormalFormQuery {
                 partition_range.len(),
                 &mut planner,
             )?;
-            if let Some(codec) = plan_type.codec {
-                plan = codec.decode(plan, &mut planner);
-            }
+            plan = plan_type.codec.decode(plan, &mut planner);
+            // TODO(perf): use more efficient solution than fuse_nulls for nullable columns (mostly requires better support in batch_merging)
             if plan.is_nullable() {
-                plan = planner.fuse_nulls(plan);
+                plan = planner.cast(plan, EncodingType::Val);
             }
-            plan = planner.collect(
-                plan,
-                &col_info
-                    .name
-                    .clone(),
-            );
+            plan = planner.collect(plan, &col_info.name.clone());
             select.push(plan.any());
         }
         let mut order_by = Vec::new();
@@ -157,9 +155,7 @@ impl NormalFormQuery {
                 partition_range.len(),
                 &mut planner,
             )?;
-            if let Some(codec) = plan_type.codec {
-                plan = codec.decode(plan, &mut planner);
-            }
+            plan = plan_type.codec.decode(plan, &mut planner);
             if plan.is_nullable() {
                 plan = planner.fuse_nulls(plan);
             }
@@ -170,7 +166,7 @@ impl NormalFormQuery {
         for c in columns {
             debug!("{}: {:?}", partition, c);
         }
-        let mut executor = planner.prepare(vec![], batch_size)?;
+        let mut executor = planner.prepare(vec![], batch_size, show)?;
         let mut results = executor.prepare(NormalFormQuery::column_data(columns));
         debug!("{:#}", &executor);
         executor.run(partition_range.len(), &mut results, show)?;
@@ -223,12 +219,7 @@ impl NormalFormQuery {
         };
 
         // Combine all group by columns into a single decodable grouping key
-        let (
-            (raw_grouping_key, is_raw_grouping_key_order_preserving),
-            max_grouping_key,
-            decode_plans,
-            encoded_group_by_placeholder,
-        ) = query_plan::compile_grouping_key(
+        let group_by_plan = query_plan::compile_grouping_key(
             &self
                 .projection
                 .iter()
@@ -247,17 +238,17 @@ impl NormalFormQuery {
             is_grouping_key_order_preserving,
             aggregation_cardinality) =
         // PERF: refine criterion
-            if max_grouping_key < 1 << 16 {
-                let max_grouping_key_buf = qp.scalar_i64(max_grouping_key, true);
+            if group_by_plan.max < 1 << 16 {
+                let max_grouping_key_buf = qp.scalar_i64(group_by_plan.max, true);
                 (None,
-                 raw_grouping_key,
-                 is_raw_grouping_key_order_preserving,
+                 group_by_plan.raw_grouping_key,
+                 group_by_plan.is_raw_grouping_key_order_preserving,
                  max_grouping_key_buf)
             } else {
                 query_plan::prepare_hashmap_grouping(
-                    raw_grouping_key,
-                    decode_plans.len(),
-                    max_grouping_key as usize,
+                    group_by_plan.raw_grouping_key,
+                    group_by_plan.decode_plans.len(),
+                    group_by_plan.max as usize,
                     &mut qp)?
             };
 
@@ -300,7 +291,7 @@ impl NormalFormQuery {
             None => qp.nonzero_indices(selector, grouping_key.tag),
             Some(x) => x,
         };
-        qp.connect(encoded_group_by_column, encoded_group_by_placeholder);
+        qp.connect(encoded_group_by_column, group_by_plan.encoded_group_by_placeholder);
 
         // Compact and decode aggregation results
         let mut aggregation_cols = Vec::new();
@@ -326,7 +317,7 @@ impl NormalFormQuery {
                     }
                 };
                 if t.is_encoded() {
-                    Ok(t.codec.unwrap().decode(compacted, &mut qp))
+                    Ok(t.codec.decode(compacted, &mut qp))
                 } else {
                     Ok(compacted)
                 }
@@ -361,15 +352,15 @@ impl NormalFormQuery {
         }
 
         //  Reconstruct all group by columns from grouping
-        let mut grouping_columns = Vec::with_capacity(decode_plans.len());
-        for (decode_plan, _t) in decode_plans {
+        let mut grouping_columns = Vec::with_capacity(group_by_plan.decode_plans.len());
+        for (decode_plan, _t) in group_by_plan.decode_plans {
             grouping_columns.push(decode_plan);
         }
 
         // If the grouping is not order preserving, we need to sort all output columns by using the ordering constructed from the decoded group by columns
         // This is necessary to make it possible to efficiently merge with other batch results
         if !is_grouping_key_order_preserving {
-            let sort_indices = if is_raw_grouping_key_order_preserving {
+            let sort_indices = if group_by_plan.is_raw_grouping_key_order_preserving {
                 let indices = qp.indices(encoded_group_by_column);
                 qp.sort_by(
                     encoded_group_by_column,
@@ -422,7 +413,7 @@ impl NormalFormQuery {
         for c in columns {
             debug!("{}: {:?}", partition, c);
         }
-        let mut executor = qp.prepare(vec![], batch_size)?;
+        let mut executor = qp.prepare(vec![], batch_size, show)?;
         let mut results = executor.prepare(NormalFormQuery::column_data(columns));
         debug!("{:#}", &executor);
         executor.run(partition_range.len(), &mut results, show)?;
@@ -473,7 +464,9 @@ impl NormalFormQuery {
 }
 
 impl Query {
-    pub fn normalize(&self) -> Result<(NormalFormQuery, Option<NormalFormQuery>, Vec<ResultColumn>), QueryError> {
+    pub fn normalize(
+        &self,
+    ) -> Result<(NormalFormQuery, Option<NormalFormQuery>, Vec<ResultColumn>), QueryError> {
         let mut final_projection = Vec::<ColumnInfo>::new();
         let mut select = Vec::<ColumnInfo>::new();
         let mut aggregate = Vec::new();
@@ -510,8 +503,8 @@ impl Query {
 
         // A projection contains a non-trivial expression that contains an aggregate (e.g. SUM(x)/COUNT(1) or SUM(x) + 4)
         let nontrivial_aggregate_expression = final_projection
-                .iter()
-                .any(|col_info| !matches!(col_info.expr, Expr::ColName(_)));
+            .iter()
+            .any(|col_info| !matches!(col_info.expr, Expr::ColName(_)));
         let sort_after_aggregation = !aggregate.is_empty() && !self.order_by.is_empty();
         let require_final_pass = sort_after_aggregation || nontrivial_aggregate_expression;
         Ok(if require_final_pass {
@@ -596,7 +589,8 @@ impl Query {
                 (Expr::Func1(*t, Box::new(expr)), aggregates)
             }
             Expr::Func2(t, expr1, expr2) => {
-                let (expr1, mut aggregates1) = Query::extract_aggregators(expr1, column_names, alias)?;
+                let (expr1, mut aggregates1) =
+                    Query::extract_aggregators(expr1, column_names, alias)?;
                 let (expr2, aggregates2) = Query::extract_aggregators(expr2, column_names, alias)?;
                 aggregates1.extend(aggregates2);
                 (

@@ -4,11 +4,11 @@ use std::str;
 use std::sync::Arc;
 
 use futures::channel::oneshot;
+use locustdb_serialization::event_buffer::EventBuffer;
 
 use crate::engine::query_task::QueryTask;
 use crate::ingest::colgen::GenTable;
 use crate::ingest::csv_loader::{CSVIngestionTask, Options as LoadOptions};
-use crate::logging_client::EventBuffer;
 use crate::mem_store::*;
 use crate::perf_counter::PerfCounter;
 use crate::scheduler::*;
@@ -155,7 +155,7 @@ impl LocustDB {
         for receiver in receivers {
             receiver.await?;
         }
-        self.mem_tree(2).await
+        self.mem_tree(2, None).await
     }
 
     pub fn recover(&self) {
@@ -163,9 +163,9 @@ impl LocustDB {
         InnerLocustDB::start_worker_threads(&self.inner_locustdb);
     }
 
-    pub async fn mem_tree(&self, depth: usize) -> Result<Vec<MemTreeTable>, oneshot::Canceled> {
+    pub async fn mem_tree(&self, depth: usize, table: Option<String>) -> Result<Vec<MemTreeTable>, oneshot::Canceled> {
         let inner = self.inner_locustdb.clone();
-        let (task, receiver) = <dyn Task>::from_fn(move || inner.mem_tree(depth));
+        let (task, receiver) = <dyn Task>::from_fn(move || inner.mem_tree(depth, table.clone()));
         self.schedule(task);
         receiver.await
     }
@@ -186,7 +186,10 @@ impl LocustDB {
     }
 
     pub fn force_flush(&self) {
-        self.inner_locustdb.wal_flush();
+        let inner = self.inner_locustdb.clone();
+        std::thread::spawn(move || inner.wal_flush())
+            .join()
+            .unwrap();
     }
 
     pub fn evict_cache(&self) -> usize {
@@ -242,9 +245,9 @@ impl Options {
         if self.read_threads == 0 {
             return Err("read_threads must be greater than 0".to_string());
         }
-        if self.partition_combine_factor == 0 {
-            return Err("partition_combine_factor must be greater than 0".to_string());
-        }
+        // if self.partition_combine_factor == 0 {
+        //     return Err("partition_combine_factor must be greater than 0".to_string());
+        // }
         if self.batch_size % 8 != 0 {
             return Err("batch_size must be a multiple of 8".to_string());
         }

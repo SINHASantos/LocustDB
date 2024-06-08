@@ -42,6 +42,8 @@ pub fn ast_builder(input: TokenStream) -> TokenStream {
                                 "Can't provide internal type ({}).",
                                 field_ident
                             );
+                            let hash_type = parse_quote!(hasher.update(&[#t.to_u8()]););
+                            hashes.push(hash_type);
                             parse_quote!(let #field_ident = self.buffer_provider.named_buffer(#ident_str, #t);)
                         } else {
                             create_buffer(&field_ident, &field_type)
@@ -68,6 +70,7 @@ pub fn ast_builder(input: TokenStream) -> TokenStream {
                             if let Some(fn_input) = fn_input {
                                 fn_inputs.push(fn_input);
                             }
+                            hashes.push(parse_quote!(hasher.update(&[#t.to_u8()]);));
                             output = parse_quote!(Some(#field_ident.buffer.i));
                             parse_quote!(let #field_ident = self.buffer_provider.named_buffer(#ident_str, #t);)
                         } else {
@@ -141,6 +144,10 @@ pub fn ast_builder(input: TokenStream) -> TokenStream {
                             self.cache.insert(signature, vec![#(#result2.into()),*]);
                         }
 
+                        if std::env::var("EARLY_OPERATOR_CHECK").is_ok() {
+                            self.clone().prepare(vec![], 1024, false).unwrap();
+                        }
+
                         (#(#result),*)
                     }
                 };
@@ -187,6 +194,8 @@ fn create_buffer(field_ident: &Ident, field_type: &Type) -> Stmt {
         parse_quote!(let #field_ident = self.buffer_provider.buffer_premerge(#field_name);)
     } else if *field_type == parse_quote!(BufferRef<Scalar<i64>>) {
         parse_quote!(let #field_ident = self.buffer_provider.buffer_scalar_i64(#field_name);)
+    } else if *field_type == parse_quote!(BufferRef<Scalar<of64>>) {
+        parse_quote!(let #field_ident = self.buffer_provider.buffer_scalar_f64(#field_name);)
     } else if *field_type == parse_quote!(BufferRef<Scalar<String>>) {
         parse_quote!(let #field_ident = self.buffer_provider.buffer_scalar_string(#field_name);)
     } else if *field_type == parse_quote!(BufferRef<Scalar<&'static str>>) {
@@ -227,6 +236,8 @@ fn convert(expr: Expr, field_type: &Type) -> Expr {
         parse_quote!(#expr.premerge().unwrap())
     } else if *field_type == parse_quote!(BufferRef<Scalar<i64>>) {
         parse_quote!(#expr.scalar_i64().unwrap())
+    } else if *field_type == parse_quote!(BufferRef<Scalar<of64>>) {
+        parse_quote!(#expr.scalar_f64().unwrap())
     } else if *field_type == parse_quote!(BufferRef<Scalar<String>>) {
         parse_quote!(#expr.scalar_string().unwrap())
     } else if *field_type == parse_quote!(BufferRef<Scalar<&'static str>>) {
@@ -239,7 +250,7 @@ fn convert(expr: Expr, field_type: &Type) -> Expr {
 fn hash(field_ident: &Ident, field_type: &Type) -> Stmt {
     if *field_type == parse_quote!(String) {
         parse_quote!(hasher.update(&#field_ident.as_bytes());)
-    } else if *field_type == parse_quote!(usize) || *field_type == parse_quote!(i64) {
+    } else if *field_type == parse_quote!(usize) || *field_type == parse_quote!(i64) || *field_type == parse_quote!(f64) {
         parse_quote!(hasher.update(&#field_ident.to_ne_bytes());)
     } else if *field_type == parse_quote!(u8) {
         parse_quote!(hasher.update(&[#field_ident]);)
@@ -304,7 +315,7 @@ fn parse_type(field_ident: &Ident, type_def: String) -> Option<(Expr, Option<FnA
                         .map(|ident| Ident::new(ident, Span::call_site()))
                         .collect::<Vec<_>>();
                     parse_quote! {
-                        if #(#parents.is_nullable())||* { #base_type.nullable() } else { #base_type }
+                        if #(#parents.is_nullable())||* && !#base_type.is_naturally_nullable() { #base_type.nullable() } else { #base_type }
                     }
                 }
             }

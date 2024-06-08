@@ -1,34 +1,17 @@
-use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use locustdb_serialization::api::{
+    AnyVal, Column, ColumnNameRequest, ColumnNameResponse, EncodingOpts, MultiQueryRequest,
+    MultiQueryResponse, QueryResponse,
+};
+use locustdb_serialization::event_buffer::EventBuffer;
+use reqwest::header::{self, AUTHORIZATION, CONTENT_TYPE};
 use tokio::select;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-
-#[derive(Default, Serialize, Deserialize, Clone)]
-pub struct EventBuffer {
-    pub tables: HashMap<String, TableBuffer>,
-}
-
-#[derive(Default, Serialize, Deserialize, Clone, Debug)]
-pub struct TableBuffer {
-    pub len: u64,
-    pub columns: HashMap<String, ColumnBuffer>,
-}
-
-#[derive(Default, Serialize, Deserialize, Clone, Debug)]
-pub struct ColumnBuffer {
-    pub data: ColumnData,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum ColumnData {
-    Dense(Vec<f64>),
-    Sparse(Vec<(u64, f64)>),
-}
 
 pub struct LoggingClient {
     // Table -> Rows
@@ -39,6 +22,11 @@ pub struct LoggingClient {
     max_buffer_size_bytes: usize,
     pub total_events: u64,
     flush_interval: Duration,
+    query_client: reqwest::Client,
+    query_url: String,
+    columns_url: String,
+    buffer_full_policy: BufferFullPolicy,
+    bearer_token: Option<String>,
 }
 
 struct BackgroundWorker {
@@ -52,8 +40,26 @@ struct BackgroundWorker {
     request_data: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
+#[derive(Debug)]
+pub enum Error {
+    Reqwest(reqwest::Error),
+    Deserialize(capnp::Error),
+    Request { status_code: u16, msg: String },
+}
+
+pub enum BufferFullPolicy {
+    Block,
+    Drop,
+}
+
 impl LoggingClient {
-    pub fn new(flush_interval: Duration, locustdb_url: &str, max_buffer_size_bytes: usize) -> LoggingClient {
+    pub fn new(
+        flush_interval: Duration,
+        locustdb_url: &str,
+        max_buffer_size_bytes: usize,
+        buffer_full_policy: BufferFullPolicy,
+        bearer_token: Option<String>,
+    ) -> LoggingClient {
         let buffer: Arc<Mutex<EventBuffer>> = Arc::default();
         let shutdown = CancellationToken::new();
         let flushed = Arc::new((Mutex::new(false), Condvar::new()));
@@ -78,10 +84,50 @@ impl LoggingClient {
             max_buffer_size_bytes,
             buffer_size,
             flush_interval,
+            query_client: reqwest::Client::new(),
+            query_url: format!("{locustdb_url}/multi_query_cols"),
+            columns_url: format!("{locustdb_url}/columns"),
+            buffer_full_policy,
+            bearer_token,
         }
     }
 
-    pub fn log<Row: IntoIterator<Item = (String, f64)>>(&mut self, table: &str, row: Row) {
+    pub async fn multi_query(&self, queries: Vec<String>) -> Result<Vec<QueryResponse>, Error> {
+        let request_body = MultiQueryRequest {
+            queries,
+            encoding_opts: Some(EncodingOpts {
+                xor_float_compression: true,
+                mantissa: None,
+                full_precision_cols: Default::default(),
+            }),
+        };
+        let response = self
+            .query_client
+            .post(&self.query_url)
+            .headers(self.headers())
+            .json(&request_body)
+            .send()
+            .await?;
+        if response.status().is_client_error() || response.status().is_server_error() {
+            let status_code = response.status().as_u16();
+            let msg = response.text().await?;
+            return Err(Error::Request { status_code, msg });
+        }
+        let bytes = response.bytes().await?.to_vec();
+        let mut rsps = MultiQueryResponse::deserialize(&bytes).unwrap().responses;
+        rsps.iter_mut().for_each(|rsp| {
+            rsp.columns.iter_mut().for_each(|(_, col)| {
+                if let Column::Xor(data) = col {
+                    *col = Column::Float(
+                        locustdb_compression_utils::xor_float::double::decode(&data[..]).unwrap(),
+                    )
+                }
+            });
+        });
+        Ok(rsps)
+    }
+
+    pub fn log<Row: IntoIterator<Item = (String, AnyVal)>>(&mut self, table: &str, row: Row) {
         let time_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -89,33 +135,91 @@ impl LoggingClient {
             / 1000.0;
         let mut warncount = 0;
         loop {
-            if self.buffer_size.load(std::sync::atomic::Ordering::SeqCst) as usize > self.max_buffer_size_bytes  {
-                if warncount % 10 == 0 {
-                    log::warn!("Logging buffer full, waiting for flush");
+            if self.buffer_size.load(std::sync::atomic::Ordering::SeqCst) as usize
+                > self.max_buffer_size_bytes
+            {
+                match self.buffer_full_policy {
+                    BufferFullPolicy::Block => {
+                        if warncount % 10 == 0 {
+                            log::warn!("Logging buffer full, waiting for flush");
+                        }
+                        warncount += 1;
+                        std::thread::sleep(self.flush_interval);
+                    }
+                    BufferFullPolicy::Drop => {
+                        log::warn!("Dropping event due to full buffer");
+                        return;
+                    }
                 }
-                warncount += 1;
-                std::thread::sleep(self.flush_interval);
             } else {
                 break;
             }
         }
         let mut events = self.events.lock().unwrap();
         let table = events.tables.entry(table.to_string()).or_default();
+        let mut timestamp_provided = false;
         for (column_name, value) in row {
-            self.buffer_size.fetch_add(8, std::sync::atomic::Ordering::SeqCst);
+            self.buffer_size
+                .fetch_add(8, std::sync::atomic::Ordering::SeqCst);
             table
                 .columns
                 .entry(column_name.to_string())
                 .or_default()
                 .push(value, table.len);
+            timestamp_provided |= column_name == "timestamp";
         }
-        table
-            .columns
-            .entry("timestamp".to_string())
-            .or_default()
-            .push(time_millis, table.len);
+        if !timestamp_provided {
+            table
+                .columns
+                .entry("timestamp".to_string())
+                .or_default()
+                .push(AnyVal::Float(time_millis), table.len);
+        }
         table.len += 1;
         self.total_events += 1;
+    }
+
+    pub async fn columns(
+        &self,
+        table: String,
+        pattern: Option<String>,
+    ) -> Result<ColumnNameResponse, Error> {
+        let request_body = ColumnNameRequest {
+            tables: vec![table],
+            pattern,
+            offset: None,
+            limit: None,
+        };
+        let response = self
+            .query_client
+            .post(&self.columns_url)
+            .headers(self.headers())
+            .json(&request_body)
+            .send()
+            .await?;
+        if response.status().is_client_error() || response.status().is_server_error() {
+            let status_code = response.status().as_u16();
+            let msg = response.text().await?;
+            return Err(Error::Request { status_code, msg });
+        }
+        Ok(response.json::<ColumnNameResponse>().await?)
+    }
+
+    /// This doesn't fully flush the buffer, just waits for current buffer to be picked up by worker.
+    /// This means there may still be one outstanding buffer that hasn't been sent.
+    pub async fn flush(&self) {
+        while self.buffer_size.load(std::sync::atomic::Ordering::SeqCst) as usize > 0 {
+            tokio::time::sleep(self.flush_interval).await;
+        }
+    }
+
+    fn headers(&self) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        if let Some(bearer_token) = self.bearer_token.as_ref() {
+            headers.insert(AUTHORIZATION, bearer_token.parse().unwrap());
+        }
+        headers
     }
 }
 
@@ -131,7 +235,9 @@ impl BackgroundWorker {
         }
         loop {
             self.flush().await;
-            if self.request_data.lock().unwrap().is_none() {
+            if self.request_data.lock().unwrap().is_none()
+                && self.events.lock().unwrap().tables.is_empty()
+            {
                 break;
             }
         }
@@ -148,7 +254,7 @@ impl BackgroundWorker {
         if request_data.is_some() {
             return;
         }
-        let serialized = bincode::serialize(&*buffer).unwrap();
+        let serialized = buffer.serialize();
         if buffer.tables.is_empty() {
             return;
         }
@@ -160,7 +266,8 @@ impl BackgroundWorker {
                 .map(|t| t.columns.values().next().map(|c| c.data.len()).unwrap_or(0))
                 .sum::<usize>()
         );
-        self.buffer_size.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.buffer_size
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         // TODO: keep all buffers on client, but don't send tables that are empty
         buffer.tables.clear();
         // for table in buffer.tables.values_mut() {
@@ -201,67 +308,48 @@ impl BackgroundWorker {
     }
 }
 
-impl ColumnBuffer {
-    fn push(&mut self, value: f64, len: u64) {
-        match &mut self.data {
-            ColumnData::Dense(data) => {
-                if data.len() as u64 == len {
-                    data.push(value)
-                } else {
-                    let mut sparse_data: Vec<(u64, f64)> = data
-                        .drain(..)
-                        .enumerate()
-                        .map(|(i, v)| (i as u64, v))
-                        .collect();
-                    sparse_data.push((len, value));
-                    self.data = ColumnData::Sparse(sparse_data);
-                }
-            }
-            ColumnData::Sparse(data) => data.push((len, value)),
-        }
-    }
-
-    // fn clear(&mut self) {
-    //     match &mut self.data {
-    //         ColumnData::Dense(data) => data.clear(),
-    //         ColumnData::Sparse(_) => {
-    //             self.data = ColumnData::Dense(Vec::new());
-    //         }
-    //     }
-    // }
-}
-
 impl Drop for LoggingClient {
     fn drop(&mut self) {
         self.shutdown.cancel();
-        let (flushed, cvar) = &*self.flushed;
-        let mut flushed = flushed.lock().unwrap();
-        while !*flushed {
-            flushed = cvar.wait(flushed).unwrap();
+        match self.buffer_full_policy {
+            BufferFullPolicy::Block => {
+                let (flushed, cvar) = &*self.flushed;
+                let mut flushed = flushed.lock().unwrap();
+                while !*flushed {
+                    flushed = cvar.wait(flushed).unwrap();
+                }
+            }
+            BufferFullPolicy::Drop => {
+                // Wait for 1 minute for the buffer to flush
+                let mut max_tries = 6;
+                while max_tries > 0 {
+                    max_tries -= 1;
+                    std::thread::sleep(Duration::from_secs(10));
+                    if *self.flushed.0.lock().unwrap() {
+                        break;
+                    }
+                }
+                log::warn!("Logging buffer not flushed, potentially dropping events");
+            }
         }
         log::info!("Logging client dropped");
     }
 }
 
-impl ColumnData {
-    pub fn len(&self) -> usize {
-        match self {
-            ColumnData::Dense(data) => data.len(),
-            ColumnData::Sparse(data) => data.len(),
-        }
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        match self {
-            ColumnData::Dense(data) => data.is_empty(),
-            ColumnData::Sparse(data) => data.is_empty(),
-        }
+impl From<reqwest::Error> for Error {
+    fn from(err: reqwest::Error) -> Self {
+        Error::Reqwest(err)
     }
 }
 
-impl Default for ColumnData {
-    fn default() -> Self {
-        ColumnData::Dense(Vec::new())
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Reqwest(err) => write!(f, "Reqwest error: {}", err),
+            Error::Deserialize(err) => write!(f, "Failed to deserialize response: {}", err),
+            Error::Request { status_code, msg } => {
+                write!(f, "Request failed ({}): {}", status_code, msg)
+            }
+        }
     }
 }

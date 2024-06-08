@@ -9,12 +9,18 @@ use actix_web::web::{Bytes, Data};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 use futures::channel::oneshot::Canceled;
 use itertools::Itertools;
+use locustdb_compression_utils::xor_float;
+use locustdb_serialization::api::{
+    self, ColumnNameRequest, EncodingOpts, MultiQueryRequest, MultiQueryResponse, QueryRequest,
+    QueryResponse,
+};
+use locustdb_serialization::event_buffer::EventBuffer;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tera::{Context, Tera};
 use tokio::sync::oneshot;
 
-use crate::{logging_client, BasicTypeColumn, LocustDB};
+use crate::{BasicTypeColumn, LocustDB};
 use crate::{QueryError, QueryOutput, Value};
 
 lazy_static! {
@@ -41,24 +47,6 @@ struct DataBatch {
 #[derive(Clone)]
 struct AppState {
     db: Arc<LocustDB>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct QueryRequest {
-    query: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ColumnNameRequest {
-    tables: Vec<String>,
-    pattern: Option<String>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct MultiQueryRequest {
-    queries: Vec<String>,
 }
 
 #[get("/")]
@@ -210,21 +198,64 @@ async fn multi_query_cols(
     req_body: web::Json<MultiQueryRequest>,
 ) -> impl Responder {
     log::debug!("Multi Query: {:?}", req_body);
-    let mut results = vec![];
+    let mut futures = vec![];
     for q in &req_body.queries {
         // Run query starts executing immediately even without awaiting future
         let result = data.db.run_query(q, false, false, vec![]);
-        results.push(result);
+        futures.push(result);
     }
-    let mut json_results = vec![];
-    for result in results {
-        let result = match flatmap_err_response(result.await) {
+    let mut results = vec![];
+    for future in futures {
+        let result = match flatmap_err_response(future.await) {
             Ok(result) => result,
             Err(err) => return err,
         };
-        json_results.push(query_output_to_json_cols(result));
+        results.push(result);
     }
-    HttpResponse::Ok().json(json_results)
+    match &req_body.encoding_opts {
+        Some(encoding_opts) => {
+            let full_precision = EncodingOpts {
+                mantissa: None,
+                ..encoding_opts.clone()
+            };
+            let mut query_responses = vec![];
+            for result in results {
+                query_responses.push(QueryResponse {
+                    columns: result
+                        .columns
+                        .into_iter()
+                        .map(|(colname, data)| {
+                            let use_full_precision =
+                                encoding_opts.full_precision_cols.contains(&colname);
+                            (
+                                colname,
+                                encode_column(
+                                    data,
+                                    if use_full_precision {
+                                        &full_precision
+                                    } else {
+                                        encoding_opts
+                                    },
+                                ),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+            let serialized = MultiQueryResponse {
+                responses: query_responses,
+            }
+            .serialize();
+            HttpResponse::Ok().body(serialized)
+        }
+        None => {
+            let json_results = results
+                .into_iter()
+                .map(query_output_to_json_cols)
+                .collect::<Vec<_>>();
+            HttpResponse::Ok().json(json_results)
+        }
+    }
 }
 
 #[post("/columns")]
@@ -261,7 +292,6 @@ fn flatmap_err_response(
     }
 }
 
-// TODO: even more efficient, push all data-conversions into client
 #[post("/insert_bin")]
 async fn insert_bin(data: web::Data<AppState>, req_body: Bytes) -> impl Responder {
     // PRINT FIRST 64 BYTES
@@ -274,13 +304,11 @@ async fn insert_bin(data: web::Data<AppState>, req_body: Bytes) -> impl Responde
         s.push_str(&format!("{:02x}", bytes[0]));
         bytes = bytes.slice(1..);
     }
-    log::debug!("Inserting bytes: {} ({})", s, req_body.len());
-
     data.db
         .perf_counter()
         .network_read_ingestion(req_body.len() as u64);
 
-    let events: logging_client::EventBuffer = match bincode::deserialize(&req_body) {
+    let events = match EventBuffer::deserialize(&req_body) {
         Ok(events) => events,
         Err(e) => {
             log::error!("Failed to deserialize /insert_bin request: {}", e);
@@ -290,11 +318,7 @@ async fn insert_bin(data: web::Data<AppState>, req_body: Bytes) -> impl Responde
     };
     log::info!(
         "Received request data for {} events",
-        events
-            .tables
-            .values()
-            .map(|t| t.columns.values().next().map(|c| c.data.len()).unwrap_or(0))
-            .sum::<usize>()
+        events.tables.values().map(|t| t.len).sum::<u64>()
     );
     data.db.ingest_efficient(events).await;
     HttpResponse::Ok().json(r#"{"status": "ok"}"#)
@@ -382,4 +406,80 @@ pub fn run(
     });
 
     Ok((handle, rx))
+}
+
+fn encode_column(col: BasicTypeColumn, encode_opts: &EncodingOpts) -> api::Column {
+    match col {
+        BasicTypeColumn::Int(xs) => api::Column::Int(xs),
+        BasicTypeColumn::Float(xs) => {
+            if encode_opts.xor_float_compression {
+                api::Column::Xor(xor_float::double::encode(&xs, 100, encode_opts.mantissa))
+            } else {
+                api::Column::Float(xs)
+            }
+        }
+        BasicTypeColumn::String(xs) => api::Column::String(xs),
+        BasicTypeColumn::Null(xs) => api::Column::Null(xs),
+        BasicTypeColumn::Mixed(xs) => {
+            let mut type_signature = 0u8;
+            for val in &xs {
+                match val {
+                    Value::Int(_) => type_signature |= 1,
+                    Value::Str(_) => type_signature |= 2,
+                    Value::Null => type_signature |= 4,
+                    Value::Float(_) => type_signature |= 8,
+                }
+            }
+            if type_signature == 2 {
+                api::Column::String(
+                    xs.into_iter()
+                        .map(|val| match val {
+                            Value::Str(str) => str,
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                )
+            } else if type_signature == 1 {
+                api::Column::Int(
+                    xs.into_iter()
+                        .map(|val| match val {
+                            Value::Int(int) => int,
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                )
+            } else if type_signature == 4 {
+                api::Column::Null(xs.len())
+            } else if type_signature == 8 || type_signature == 12 {
+                let floats: Vec<f64> = xs
+                    .into_iter()
+                    .map(|val| match val {
+                        Value::Float(float) => float.0,
+                        Value::Null => xor_float::NULL,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                if encode_opts.xor_float_compression {
+                    api::Column::Xor(xor_float::double::encode(
+                        &floats,
+                        100,
+                        encode_opts.mantissa,
+                    ))
+                } else {
+                    api::Column::Float(floats)
+                }
+            } else {
+                api::Column::Mixed(
+                    xs.into_iter()
+                        .map(|val| match val {
+                            Value::Int(int) => api::AnyVal::Int(int),
+                            Value::Str(str) => api::AnyVal::Str(str),
+                            Value::Null => api::AnyVal::Null,
+                            Value::Float(float) => api::AnyVal::Float(float.0),
+                        })
+                        .collect(),
+                )
+            }
+        }
+    }
 }

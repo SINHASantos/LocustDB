@@ -17,7 +17,7 @@ use super::aggregate::*;
 use super::assemble_nullable::AssembleNullable;
 use super::binary_operator::*;
 use super::bit_unpack::BitUnpackOperator;
-use super::bool_op::*;
+// use super::bool_op::*;
 use super::buffer_stream::*;
 use super::collect::Collect;
 use super::column_ops::*;
@@ -61,6 +61,7 @@ use super::numeric_operators::*;
 use super::parameterized_vec_vec_int_op::*;
 use super::partition::Partition;
 use super::propagate_nullability::PropagateNullability;
+use super::scalar_f64::ScalarF64;
 use super::scalar_i64::ScalarI64;
 use super::scalar_str::ScalarStr;
 use super::select::*;
@@ -172,6 +173,8 @@ fn short_type_name<T: ?Sized>() -> String {
 
 #[allow(clippy::branches_sharing_code)]
 pub mod operator {
+    use vector_operator::operators::scalar_i64_to_scalar_f64::ScalarI64ToScalarF64;
+
     use super::*;
 
     pub fn read_column_data<'a>(
@@ -198,6 +201,16 @@ pub mod operator {
                 data: data.u8()?,
                 present,
                 nullable_data: nullable_data.nullable_u8()?,
+            })),
+            EncodingType::U16 => Ok(Box::new(AssembleNullable {
+                data: data.u16()?,
+                present,
+                nullable_data: nullable_data.nullable_u16()?,
+            })),
+            EncodingType::U32 => Ok(Box::new(AssembleNullable {
+                data: data.u32()?,
+                present,
+                nullable_data: nullable_data.nullable_u32()?,
             })),
             EncodingType::I64 => Ok(Box::new(AssembleNullable {
                 data: data.i64()?,
@@ -228,6 +241,16 @@ pub mod operator {
                 data: data.u8()?,
                 present,
                 nullable_data: nullable_data.nullable_u8()?,
+            })),
+            EncodingType::U16 => Ok(Box::new(MakeNullable {
+                data: data.u16()?,
+                present,
+                nullable_data: nullable_data.nullable_u16()?,
+            })),
+            EncodingType::U32 => Ok(Box::new(MakeNullable {
+                data: data.u32()?,
+                present,
+                nullable_data: nullable_data.nullable_u32()?,
             })),
             EncodingType::I64 => Ok(Box::new(MakeNullable {
                 data: data.i64()?,
@@ -269,10 +292,25 @@ pub mod operator {
                 to: data.u8()?,
                 output: output.nullable_u8()?,
             })),
+            EncodingType::U16 => Ok(Box::new(PropagateNullability {
+                from: nullability,
+                to: data.u16()?,
+                output: output.nullable_u16()?,
+            })),
+            EncodingType::U32 => Ok(Box::new(PropagateNullability {
+                from: nullability,
+                to: data.u32()?,
+                output: output.nullable_u32()?,
+            })),
             EncodingType::I64 => Ok(Box::new(PropagateNullability {
                 from: nullability,
                 to: data.i64()?,
                 output: output.nullable_i64()?,
+            })),
+            EncodingType::F64 => Ok(Box::new(PropagateNullability {
+                from: nullability,
+                to: data.f64()?,
+                output: output.nullable_f64()?,
             })),
             EncodingType::Str => Ok(Box::new(PropagateNullability {
                 from: nullability,
@@ -473,7 +511,6 @@ pub mod operator {
         ]
     }
 
-    #[cfg(feature = "enable_lz4")]
     pub fn lz4_decode<'a>(
         encoded: BufferRef<u8>,
         decoded_len: usize,
@@ -489,13 +526,18 @@ pub mod operator {
         }
     }
 
-    #[cfg(not(feature = "enable_lz4"))]
-    pub fn lz4_decode<'a>(
-        _: BufferRef<u8>,
-        _: usize,
-        _: TypedBufferRef,
+    pub fn pco_decode<'a>(
+        encoded: BufferRef<u8>,
+        decoded_len: usize,
+        decoded: TypedBufferRef,
+        is_fp32: bool,
     ) -> Result<BoxedOperator<'a>, QueryError> {
-        panic!("LZ4 is not enabled in this build of LocustDB. Recompile with `features enable_lz4`")
+        use crate::engine::operators::pco_decode::PcoDecode;
+        reify_types! {
+            "pco_decode";
+            decoded: Number;
+            Ok(Box::new(PcoDecode { encoded, decoded, decoded_len, has_more: true, is_fp32 }))
+        }
     }
 
     pub fn unpack_strings<'a>(
@@ -617,11 +659,11 @@ pub mod operator {
         output: TypedBufferRef,
     ) -> Result<BoxedOperator<'a>, QueryError> {
         if input.is_null() {
-            Ok(null_vec_like(input.any(), output.any(), LengthSource::InputLength))
+            Ok(null_vec_like(indices.any(), output.any(), LengthSource::InputLength))
         } else {
             reify_types! {
                 "select";
-                input, output: PrimitiveUSize;
+                input, output: VecData;
                 Ok(Box::new(Select { input, indices, output }));
                 input, output: NullablePrimitive;
                 Ok(Box::new(SelectNullable { input, indices, output }))
@@ -648,6 +690,18 @@ pub mod operator {
     ) -> BoxedOperator<'a> {
         Box::new(ScalarI64 {
             val,
+            hide_value,
+            output,
+        })
+    }
+
+    pub fn scalar_f64<'a>(
+        val: f64,
+        hide_value: bool,
+        output: BufferRef<Scalar<of64>>,
+    ) -> BoxedOperator<'a> {
+        Box::new(ScalarF64 {
+            val: OrderedFloat(val),
             hide_value,
             output,
         })
@@ -695,6 +749,13 @@ pub mod operator {
                 len,
                 batch_size: 0, // initialized later
             })),
+            EncodingType::I64 => Ok(Box::new(ConstantExpand {
+                val,
+                output: output.i64()?,
+                current_index: 0,
+                len,
+                batch_size: 0, // initialized later
+            })),
             _ => Err(fatal!(
                 "constant_expand not implemented for type {:?}",
                 output.tag
@@ -725,6 +786,13 @@ pub mod operator {
             lhs: ScalarI64, rhs: IntegerNoU64;
             Ok(Box::new(BinarySVOperator { lhs, rhs, output, op: PhantomData::<LessThan> }));
             lhs: IntegerNoU64, rhs: IntegerNoU64;
+            Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<LessThan> }));
+
+            lhs: Float, rhs: ScalarF64;
+            Ok(Box::new(BinaryVSOperator { lhs, rhs, output, op: PhantomData::<LessThan> }));
+            lhs: ScalarF64, rhs: Float;
+            Ok(Box::new(BinarySVOperator { lhs, rhs, output, op: PhantomData::<LessThan> }));
+            lhs: Float, rhs: Float;
             Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<LessThan> }))
         }
     }
@@ -748,6 +816,13 @@ pub mod operator {
             lhs: ScalarI64, rhs: IntegerNoU64;
             Ok(Box::new(BinarySVOperator { lhs, rhs, output, op: PhantomData::<LessThanEquals> }));
             lhs: IntegerNoU64, rhs: IntegerNoU64;
+            Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<LessThanEquals> }));
+
+            lhs: Float, rhs: ScalarF64;
+            Ok(Box::new(BinaryVSOperator { lhs, rhs, output, op: PhantomData::<LessThanEquals> }));
+            lhs: ScalarF64, rhs: Float;
+            Ok(Box::new(BinarySVOperator { lhs, rhs, output, op: PhantomData::<LessThanEquals> }));
+            lhs: Float, rhs: Float;
             Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<LessThanEquals> }))
         }
     }
@@ -771,6 +846,13 @@ pub mod operator {
             lhs: ScalarI64, rhs: IntegerNoU64;
             Ok(Box::new(BinaryVSOperator { lhs: rhs, rhs: lhs, output, op: PhantomData::<Equals> }));
             lhs: IntegerNoU64, rhs: IntegerNoU64;
+            Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<Equals> }));
+
+            lhs: Float, rhs: ScalarF64;
+            Ok(Box::new(BinaryVSOperator { lhs, rhs, output, op: PhantomData::<Equals> }));
+            lhs: ScalarF64, rhs: Float;
+            Ok(Box::new(BinaryVSOperator { lhs: rhs, rhs: lhs, output, op: PhantomData::<Equals> }));
+            lhs: Float, rhs: Float;
             Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<Equals> }))
         }
     }
@@ -794,6 +876,13 @@ pub mod operator {
             lhs: ScalarI64, rhs: IntegerNoU64;
             Ok(Box::new(BinaryVSOperator { lhs: rhs, rhs: lhs, output, op: PhantomData::<NotEquals> }));
             lhs: IntegerNoU64, rhs: IntegerNoU64;
+            Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<NotEquals> }));
+
+            lhs: Float, rhs: ScalarF64;
+            Ok(Box::new(BinaryVSOperator { lhs, rhs, output, op: PhantomData::<NotEquals> }));
+            lhs: ScalarF64, rhs: Float;
+            Ok(Box::new(BinaryVSOperator { lhs: rhs, rhs: lhs, output, op: PhantomData::<NotEquals> }));
+            lhs: Float, rhs: Float;
             Ok(Box::new(BinaryOperator { lhs, rhs, output, op: PhantomData::<NotEquals> }))
         }
     }
@@ -1056,7 +1145,14 @@ pub mod operator {
         rhs: BufferRef<u8>,
         output: BufferRef<u8>,
     ) -> BoxedOperator<'a> {
-        BooleanOperator::<BooleanOr>::compare(lhs, rhs, output)
+        // TODO(perf): carefully reenable inplace boolean operators in cases where we can prove that this preserves semantics. Last bug that prevented this was modyfing buffer from ConstantExpand which didn't get reset in subsequent iterations.
+        // InplaceBooleanOperator::<BooleanOr>::compare(lhs, rhs, output)
+        Box::new(BinaryOperator {
+            lhs,
+            rhs,
+            output,
+            op: PhantomData::<BoolOr>,
+        })
     }
 
     pub fn and<'a>(
@@ -1064,7 +1160,13 @@ pub mod operator {
         rhs: BufferRef<u8>,
         output: BufferRef<u8>,
     ) -> BoxedOperator<'a> {
-        BooleanOperator::<BooleanAnd>::compare(lhs, rhs, output)
+        Box::new(BinaryOperator {
+            lhs,
+            rhs,
+            output,
+            op: PhantomData::<BoolAnd>,
+        })
+        // InplaceBooleanOperator::<BooleanAnd>::compare(lhs, rhs, output)
     }
 
     pub fn bit_shift_left_add<'a>(
@@ -1174,20 +1276,19 @@ pub mod operator {
         input: TypedBufferRef,
         output: TypedBufferRef,
     ) -> Result<BoxedOperator<'a>, QueryError> {
+        if input.tag == output.tag {
+            return Ok(Box::new(Identity {
+                input: input.any(),
+                output: output.any(),
+            }));
+        }
         if output.tag == EncodingType::Val {
             let output = output.val()?;
             if input.tag.is_nullable() {
-                if input.tag == EncodingType::NullableStr {
-                    Ok(Box::new(NullableStrToVal {
-                        input: input.nullable_str()?,
-                        vals: output,
-                    }) as BoxedOperator<'a>)
-                } else {
-                    reify_types! {
-                        "nullable_int_to_val";
-                        input: NullableInteger;
-                        Ok(Box::new(NullableIntToVal { input, vals: output }) as BoxedOperator<'a>)
-                    }
+                reify_types! {
+                    "nullable_to_val";
+                    input: NullablePrimitive;
+                    Ok(Box::new(NullableToVal { input, vals: output }) as BoxedOperator<'a>)
                 }
             } else if input.tag == EncodingType::Null {
                 Ok(Box::new(NullToVal {
@@ -1230,14 +1331,23 @@ pub mod operator {
                 output: NullablePrimitive;
                 Ok(Box::new(NullToVec { input: input.any(), output, batch_size: 0 }))
             }
+        } else if input.tag.is_constant() {
+            assert!(output.tag.is_constant(), "constant to non-constant conversion not supported");
+            if input.tag == EncodingType::ScalarI64 && output.tag == EncodingType::ScalarF64 {
+                return Ok(Box::new(ScalarI64ToScalarF64 {
+                    input: input.scalar_i64()?,
+                    output: output.scalar_f64()?,
+                }));
+            } else {
+                panic!("Scalar conversion from {:?} to {:?} is not implemented", input.tag, output.tag);
+            }
         } else {
             if input.tag == EncodingType::Str && output.tag == EncodingType::OptStr {
                 return Ok(Box::new(TypeConversionOperator {
                     input: input.str()?,
                     output: output.opt_str()?,
                 }));
-            }
-            if input.tag == EncodingType::F64 && output.tag == EncodingType::OptF64 {
+            } else if input.tag == EncodingType::F64 && output.tag == EncodingType::OptF64 {
                 return Ok(Box::new(TypeConversionOperator {
                     input: input.f64()?,
                     output: output.opt_f64()?,

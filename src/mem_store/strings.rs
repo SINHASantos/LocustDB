@@ -1,4 +1,3 @@
-use hex;
 use seahash::SeaHasher;
 
 use crate::engine::data_types::*;
@@ -32,7 +31,6 @@ where
     for s in strings.clone() {
         unique_values.insert(s);
         // PERF: is 2 the right constant? and should probably also depend on the length of the strings
-        // TODO(#103): len > 1000 || name == "string_packed" is a hack to make tests use dictionary encoding. Remove once we are able to group by string packed columns.
         if unique_values.len() == len / DICTIONARY_RATIO {
             let (mut codec, data) = if (lhex || uhex) && total_bytes / len > 5 {
                 let packed = PackedBytes::from_iterator(strings.map(|s| hex::decode(s).unwrap()));
@@ -51,7 +49,7 @@ where
             } else {
                 Column::new(name, len, None, codec, vec![data])
             };
-            column.lz4_encode();
+            column.lz4_or_pco_encode();
             return Arc::new(column);
         }
     }
@@ -125,7 +123,7 @@ where
         data_sections.push(DataSection::Bitvec(present));
     }
     let mut column = Column::new(name, len, range, codec, data_sections);
-    column.lz4_encode();
+    column.lz4_or_pco_encode();
     Arc::new(column)
 }
 

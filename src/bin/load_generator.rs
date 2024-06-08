@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use locustdb::logging_client::BufferFullPolicy;
+use locustdb_serialization::api::any_val_syntax::vf64;
 use structopt::StructOpt;
 use tokio::time;
 
@@ -29,6 +31,10 @@ struct Opt {
     /// Number of columns logged per row
     #[structopt(long, name = "COLUMNS", default_value = "20")]
     columns: u64,
+
+    /// Prefix for table names
+    #[structopt(long, name = "PREFIX", default_value = "")]
+    table_prefix: String,
 }
 
 #[tokio::main]
@@ -40,17 +46,19 @@ async fn main() {
         tables: n_tables,
         rowcount,
         columns,
+        table_prefix,
     } = Opt::from_args();
     let rowcount = rowcount.unwrap_or_else(Vec::new);
     let tables: Vec<_> = (0..n_tables)
-        .map(|i| {
-            format!(
-                "{}_{i}",
-                random_word::gen(random_word::Lang::En).to_string()
-            )
-        })
+        .map(|i| format!("{table_prefix}{}_{i}", random_word::gen(random_word::Lang::En),))
         .collect();
-    let mut log = locustdb::logging_client::LoggingClient::new(Duration::from_secs(1), &addr, 1 << 28);
+    let mut log = locustdb::logging_client::LoggingClient::new(
+        Duration::from_secs(1),
+        &addr,
+        1 << 28,
+        BufferFullPolicy::Block,
+        None,
+    );
     let mut interval = time::interval(Duration::from_millis(interval));
 
     loop {
@@ -59,7 +67,7 @@ async fn main() {
             for _ in 0..(rowcount.get(i).cloned().unwrap_or(1)) {
                 log.log(
                     table,
-                    (0..columns).map(|c| (format!("col_{c}"), rand::random::<f64>())),
+                    (0..columns).map(|c| (format!("col_{c}"), vf64(rand::random::<f64>()))),
                 );
             }
         }

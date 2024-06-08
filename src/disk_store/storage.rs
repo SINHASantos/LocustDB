@@ -1,31 +1,16 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use serde::{Deserialize, Serialize};
-
-use super::file_writer::{BlobWriter, FileBlobWriter};
-use super::{ColumnLoader, PartitionMetadata, SubpartitionMetadata};
-use crate::logging_client::EventBuffer;
+use super::azure_writer::AzureBlobWriter;
+use super::file_writer::{BlobWriter, FileBlobWriter, VersionedChecksummedBlobWriter};
+use super::gcs_writer::GCSBlobWriter;
+use super::meta_store::{MetaStore, PartitionMetadata, SubpartitionMetadata};
+use super::partition_segment::PartitionSegment;
+use super::wal_segment::WalSegment;
+use super::{ColumnLoader, PartitionID};
 use crate::mem_store::{Column, DataSource};
 use crate::perf_counter::{PerfCounter, QueryPerfCounter};
-
-#[derive(Serialize, Deserialize)]
-pub struct WALSegment<'a> {
-    pub id: u64,
-    pub data: Cow<'a, EventBuffer>,
-}
-
-type TableName = String;
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct MetaStore {
-    pub next_wal_id: u64,
-    pub partitions: HashMap<TableName, HashMap<PartitionID, PartitionMetadata>>,
-}
-
-type PartitionID = u64;
 
 impl ColumnLoader for Storage {
     fn load_column(
@@ -63,13 +48,57 @@ impl Storage {
         path: &Path,
         perf_counter: Arc<PerfCounter>,
         readonly: bool,
-    ) -> (Storage, Vec<WALSegment>) {
+    ) -> (Storage, Vec<WalSegment<'static>>) {
+        let (writer, path): (Box<dyn BlobWriter + Send + Sync + 'static>, PathBuf) =
+            if path.starts_with("gs://") {
+                let components = path.components().collect::<Vec<_>>();
+                if components.len() < 2 {
+                    panic!("Invalid GCS path: {:?}", path);
+                }
+                let bucket = components[1]
+                    .as_os_str()
+                    .to_str()
+                    .expect("Invalid GCS path");
+                // create new path that omits the first two components
+                let path = components[2..]
+                    .iter()
+                    .map(|c| c.as_os_str())
+                    .collect::<PathBuf>();
+                (
+                    Box::new(GCSBlobWriter::new(bucket.to_string()).unwrap()),
+                    path,
+                )
+            } else if path.starts_with("az://") {
+                let components = path.components().collect::<Vec<_>>();
+                if components.len() < 3 {
+                    panic!("Invalid Azure path: {:?}", path);
+                }
+                let account = components[1]
+                    .as_os_str()
+                    .to_str()
+                    .expect("Invalid Azure path");
+                let container = components[2]
+                    .as_os_str()
+                    .to_str()
+                    .expect("Invalid Azure path");
+                // create new path that omits the first three components
+                let path = components[3..]
+                    .iter()
+                    .map(|c| c.as_os_str())
+                    .collect::<PathBuf>();
+                (
+                    Box::new(AzureBlobWriter::new(account, container).unwrap()),
+                    path,
+                )
+            } else {
+                (Box::new(FileBlobWriter::new()), path.to_owned())
+            };
+        let writer = Box::new(VersionedChecksummedBlobWriter::new(writer));
         let meta_db_path = path.join("meta");
         let wal_dir = path.join("wal");
         let tables_path = path.join("tables");
-        let writer = Box::new(FileBlobWriter::new());
         let (meta_store, wal_segments) = Storage::recover(
-            &writer,
+            writer.as_ref(),
             &meta_db_path,
             &wal_dir,
             readonly,
@@ -90,16 +119,16 @@ impl Storage {
     }
 
     fn recover(
-        writer: &FileBlobWriter,
+        writer: &dyn BlobWriter,
         meta_db_path: &Path,
         wal_dir: &Path,
         readonly: bool,
         perf_counter: &PerfCounter,
-    ) -> (MetaStore, Vec<WALSegment<'static>>) {
+    ) -> (MetaStore, Vec<WalSegment<'static>>) {
         let mut meta_store: MetaStore = if writer.exists(meta_db_path).unwrap() {
             let data = writer.load(meta_db_path).unwrap();
             perf_counter.disk_read_meta_store(data.len() as u64);
-            bincode::deserialize(&data).unwrap()
+            MetaStore::deserialize(&data).unwrap()
         } else {
             MetaStore {
                 next_wal_id: 0,
@@ -110,10 +139,12 @@ impl Storage {
         let mut wal_segments = Vec::new();
         let next_wal_id = meta_store.next_wal_id;
         log::info!("Recovering from wal checkpoint {}", next_wal_id);
-        for wal_file in writer.list(wal_dir).unwrap() {
+        let wal_files = writer.list(wal_dir).unwrap();
+        log::info!("Found {} wal segments", wal_files.len());
+        for wal_file in wal_files {
             let wal_data = writer.load(&wal_file).unwrap();
             perf_counter.disk_read_wal(wal_data.len() as u64);
-            let wal_segment: WALSegment = bincode::deserialize(&wal_data).unwrap();
+            let wal_segment = WalSegment::deserialize(&wal_data).unwrap();
             log::info!(
                 "Found wal segment {} with id {} and {} rows in {} tables",
                 wal_file.display(),
@@ -122,11 +153,11 @@ impl Storage {
                 wal_segment.data.tables.len(),
             );
             if wal_segment.id < next_wal_id {
-                if !readonly {
+                if readonly {
+                    log::info!("Skipping wal segment {}", wal_file.display());
+                } else {
                     writer.delete(&wal_file).unwrap();
                     log::info!("Deleting wal segment {}", wal_file.display());
-                } else {
-                    log::info!("Skipping wal segment {}", wal_file.display());
                 }
             } else {
                 wal_segments.push(wal_segment);
@@ -142,7 +173,7 @@ impl Storage {
     }
 
     fn write_metastore(&self, meta_store: &MetaStore) {
-        let data = bincode::serialize(meta_store).unwrap();
+        let data = meta_store.serialize();
         self.perf_counter.disk_write_meta_store(data.len() as u64);
         self.writer.store(&self.meta_db_path, &data).unwrap();
     }
@@ -153,9 +184,9 @@ impl Storage {
         subpartition_cols: Vec<Vec<Arc<Column>>>,
     ) {
         for (metadata, cols) in partition.subpartitions.iter().zip(subpartition_cols) {
-            let table_dir = self.tables_path.join(&partition.tablename);
+            let table_dir = self.tables_path.join(sanitize_table_name(&partition.tablename));
             let cols = cols.iter().map(|col| &**col).collect::<Vec<_>>();
-            let data = bincode::serialize(&cols).unwrap();
+            let data = PartitionSegment::serialize(&cols[..]);
             self.perf_counter
                 .new_partition_file_write(data.len() as u64);
             self.writer
@@ -171,14 +202,14 @@ impl Storage {
         &self.meta_store
     }
 
-    pub fn persist_wal_segment(&self, mut segment: WALSegment) -> u64 {
+    pub fn persist_wal_segment(&self, mut segment: WalSegment) -> u64 {
         {
             let mut meta_store = self.meta_store.write().unwrap();
             segment.id = meta_store.next_wal_id;
             meta_store.next_wal_id += 1;
         }
         let path = self.wal_dir.join(format!("{}.wal", segment.id));
-        let data = bincode::serialize(&segment).unwrap();
+        let data = segment.serialize();
         self.perf_counter.disk_write_wal(data.len() as u64);
         self.writer.store(&path, &data).unwrap();
         data.len() as u64
@@ -272,7 +303,7 @@ impl Storage {
         self.write_metastore(&meta_store);
 
         // Delete old partition files
-        let table_dir = self.tables_path.join(table);
+        let table_dir = self.tables_path.join(sanitize_table_name(table));
         for (id, key) in to_delete {
             let path = table_dir.join(partition_filename(id, &key));
             self.writer.delete(&path).unwrap();
@@ -290,15 +321,37 @@ impl Storage {
             .subpartition_key(column_name);
         let path = self
             .tables_path
-            .join(table_name)
+            .join(sanitize_table_name(table_name))
             .join(partition_filename(partition, &subpartition_key));
         let data = self.writer.load(&path).unwrap();
         self.perf_counter.disk_read_partition(data.len() as u64);
         perf_counter.disk_read(data.len() as u64);
-        bincode::deserialize(&data).unwrap()
+        PartitionSegment::deserialize(&data).unwrap().columns
     }
 }
 
 fn partition_filename(id: PartitionID, subpartition_key: &str) -> String {
     format!("{:05}_{}.part", id, subpartition_key)
+}
+
+/// Sanitize table name to ensure valid file name:
+/// - converts to lowercase
+/// - removes any characters that are not alphanumeric, underscore, hyphen, or dot
+/// - strip leading dashes and dots
+/// - truncates to max 255-64-2=189 characters
+/// - if name was modified, prepend underscore and append hash of original name
+fn sanitize_table_name(table_name: &str) -> String {
+    let mut name = table_name.to_lowercase();
+    name.retain(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    name = name.trim_start_matches(|c| c == '-' || c == '.').to_string();
+    if name.len() > 189 {
+        name = name[..189].to_string();
+    }
+    if name != table_name {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(table_name.as_bytes());
+        name = format!("-{}-{:x}", name, hasher.finalize());
+    }
+    name
 }

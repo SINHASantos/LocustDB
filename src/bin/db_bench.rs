@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use locustdb::logging_client::BufferFullPolicy;
 use locustdb::LocustDB;
+use locustdb_serialization::api::any_val_syntax::vf64;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use structopt::StructOpt;
@@ -181,9 +183,14 @@ async fn main() {
 
 fn ingest(opts: &Opts, db: &LocustDB, small_tables: &[String]) -> u64 {
     let load_factor = opts.load_factor;
-    let addr = "http://localhost:8080";
-    let mut log =
-        locustdb::logging_client::LoggingClient::new(Duration::from_secs(1), addr, 64 * (1 << 20));
+    let addr = "http://localhost:8888";
+    let mut log = locustdb::logging_client::LoggingClient::new(
+        Duration::from_secs(1),
+        addr,
+        64 * (1 << 20),
+        BufferFullPolicy::Block,
+        None,
+    );
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
     if !opts.large_only {
         log::info!("Starting small table logging");
@@ -191,7 +198,7 @@ fn ingest(opts: &Opts, db: &LocustDB, small_tables: &[String]) -> u64 {
             for table in small_tables {
                 log.log(
                     table,
-                    (0..1 << load_factor).map(|c| (format!("col_{c}"), rng.gen::<f64>())),
+                    (0..1 << load_factor).map(|c| (format!("col_{c}"), vf64(rng.gen::<f64>()))),
                 );
             }
         }
@@ -210,7 +217,7 @@ fn ingest(opts: &Opts, db: &LocustDB, small_tables: &[String]) -> u64 {
         for table in &large_tables {
             log.log(
                 table,
-                (0..n).map(|c| (format!("col_{c:06}"), rng.gen::<f64>())),
+                (0..n).map(|c| (format!("col_{c:06}"), vf64(rng.gen::<f64>()))),
             );
         }
     }
@@ -511,3 +518,10 @@ fn small_table_names(load_factor: u64) -> Vec<String> {
 //   ingestion bytes:    1.02GiB
 // query
 //   files opened: 25
+
+
+
+// Testing azure (requires azure credentials):
+//
+// az login
+// RUST_BACKTRACE=1 RUST_LOG=info cargo run --bin db_bench --release -- --load-factor=6 --large-only --db-path=az://locustdbstoragetesting/dev/240505-lf6

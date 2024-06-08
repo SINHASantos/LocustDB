@@ -2,7 +2,6 @@ use std::cmp;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::iter::Iterator;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,7 +20,6 @@ use crate::perf_counter::QueryPerfCounter;
 use crate::scheduler::disk_read_scheduler::DiskReadScheduler;
 use crate::scheduler::*;
 use crate::syntax::expression::*;
-use crate::QueryError;
 use crate::QueryResult;
 
 pub struct QueryTask {
@@ -320,7 +318,7 @@ impl QueryTask {
             }
             let full_result = owned_results.into_iter().next().unwrap().1;
             let final_result = if let Some(final_pass) = &self.final_pass {
-                let data_sources = full_result.into_columns();
+                let (data_sources, _unsafe_referenced_buffers) = full_result.into_columns();
                 let cols = unsafe {
                     mem::transmute::<
                         &HashMap<String, Arc<dyn DataSource>>,
@@ -507,6 +505,7 @@ impl BasicTypeColumn {
                 BasicTypeColumn::Mixed(vals)
             }
             EncodingType::ScalarI64
+            | EncodingType::ScalarF64
             | EncodingType::ScalarStr
             | EncodingType::ScalarString
             | EncodingType::ConstVal

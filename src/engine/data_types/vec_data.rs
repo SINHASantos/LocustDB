@@ -8,7 +8,6 @@ use std::io::Cursor;
 
 use num::PrimInt;
 use byteorder::{NativeEndian, ReadBytesExt};
-use ordered_float::OrderedFloat;
 use crate::ingest::raw_val::RawVal;
 use itertools::Itertools;
 
@@ -26,12 +25,14 @@ pub trait VecData<T>: PartialEq + Ord + Copy + Debug + Sync + Send {
 impl VecData<u8> for u8 {
     fn unwrap<'a, 'b>(vec: &'b dyn Data<'a>) -> &'b [u8] where u8: 'a { vec.cast_ref_u8() }
     fn unwrap_mut<'a, 'b>(vec: &'b mut dyn Data<'a>) -> &'b mut Vec<u8> where u8: 'a { vec.cast_ref_mut_u8() }
+    fn wrap_one(value: u8) -> RawVal { RawVal::Int(i64::from(value)) }
     fn t() -> EncodingType { EncodingType::U8 }
 }
 
 impl VecData<u16> for u16 {
     fn unwrap<'a, 'b>(vec: &'b dyn Data<'a>) -> &'b [u16] where u16: 'a { vec.cast_ref_u16() }
     fn unwrap_mut<'a, 'b>(vec: &'b mut dyn Data<'a>) -> &'b mut Vec<u16> where u16: 'a { vec.cast_ref_mut_u16() }
+    fn wrap_one(value: u16) -> RawVal { RawVal::Int(i64::from(value)) }
     fn t() -> EncodingType { EncodingType::U16 }
 }
 
@@ -269,7 +270,7 @@ pub fn display_slice<T: Debug>(slice: &[T], max_chars: usize) -> String {
 fn _display_slice<T: Debug>(slice: &[T], max: usize) -> String {
     let mut result = String::new();
     write!(result, "[").unwrap();
-    write!(result, "{}", slice[..max].iter().map(|x| format!("{:?}", x)).join(", ")).unwrap();
+    write!(result, "{}", slice[..max.min(slice.len())].iter().map(|x| format!("{:?}", x)).join(", ")).unwrap();
     if max < slice.len() {
         write!(result, ", ...] ({} more)", slice.len() - max).unwrap();
     } else {

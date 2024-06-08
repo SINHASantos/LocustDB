@@ -20,7 +20,7 @@ mod unicode;
     author = "Clemens Winter <clemenswinter1@gmail.com>"
 )]
 struct Opt {
-    /// Database path
+    /// Database path. Supports both local file paths and Google cloud storage paths (gs://bucket/folder)
     #[structopt(long, name = "PATH", parse(from_os_str))]
     db_path: Option<PathBuf>,
 
@@ -32,7 +32,7 @@ struct Opt {
     #[structopt(long, name = "NAME", default_value = "default")]
     table: String,
 
-    /// Limit for in-memory size of tables in GiB")
+    /// Limit for in-memory size of tables in GiB
     #[structopt(long, name = "GB", default_value = "8")]
     mem_limit_tables: usize,
 
@@ -43,6 +43,10 @@ struct Opt {
     /// Maximum size of partition files in bytes
     #[structopt(long, name = "PART_SIZE", default_value = "8388608")]
     max_partition_size_bytes: u64,
+
+    /// Combine partitions when the size of every original partition is less than this factor of the combined partition size
+    #[structopt(long, name = "FACTOR", default_value = "4")]
+    partition_combine_factor: u64,
 
     /// Comma separated list specifying the types and (optionally) names of all columns in files specified by `--load` option.
     /// Valid types: `s`, `string`, `i`, `integer`, `ns` (nullable string), `ni` (nullable integer)
@@ -119,6 +123,7 @@ fn main() {
         server,
         max_wal_size_bytes,
         max_partition_size_bytes,
+        partition_combine_factor,
         cors_allow_all,
         cors_allow_origin,
         addrs,
@@ -135,7 +140,7 @@ fn main() {
         seq_disk_read,
         max_wal_size_bytes,
         max_partition_size_bytes,
-        partition_combine_factor: 4,
+        partition_combine_factor,
         batch_size,
         max_partition_length: 1024 * 1024,
     };
@@ -226,7 +231,7 @@ fn repl(locustdb: &LocustDB) {
             println!("Special commands:
                       help - Display this message
                       :load <TABLE> <SCHEMA> <FILES>... - Load FILES into TABLE according to SCHEMA.
-                      :memtree(<N>) - Display breakdown of memory usage up to a depth of N (at most 4).
+                      :memtree(<N>,[TABLE]) - Display breakdown of memory usage up to a depth of N (at most 4).
                       :explain <QUERY> - Run and display the query plan for QUERY.
                       :show(<N>) <QUERY> - Run QUERY and show all intermediary results in partition N.:w
                       :table_stats - Print columns and basic statistics for all tables.
@@ -241,15 +246,37 @@ fn repl(locustdb: &LocustDB) {
         let mut show = vec![];
         let mut s: &str = &s;
         if s.starts_with(":memtree") {
-            let depth = if s.starts_with(":memtree(") {
-                let end = s.find(')').unwrap();
-                s[9..end]
-                    .parse::<usize>()
-                    .expect("must pass integer to :memtree(x) command")
+            let (depth, table) = if s.starts_with(":memtree(") {
+                match s.find(')') {
+                    Some(end) => match s.find(',') {
+                        Some(comma) => {
+                            if comma >= end {
+                                println!("Expected comma before closing paren in :memtree command");
+                                continue;
+                            }
+                            (
+                                s[9..comma]
+                                    .parse::<usize>()
+                                    .expect("must pass integer to :memtree(x) command"),
+                                Some(s[comma+1..end].trim_start_matches(' ').to_string()),
+                            )
+                        }
+                        None => (
+                            s[9..end]
+                                .parse::<usize>()
+                                .expect("must pass integer to :memtree(x) command"),
+                            None,
+                        ),
+                    },
+                    None => {
+                        println!("Expected closing parenthesis in :memtree command");
+                        continue;
+                    }
+                }
             } else {
-                2
+                (2, None)
             };
-            match block_on(locustdb.mem_tree(depth)) {
+            match block_on(locustdb.mem_tree(depth, table)) {
                 Ok(trees) => {
                     for tree in trees {
                         println!("{}\n", &tree)
